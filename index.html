@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <title>RETIfica</title>
+  <link rel="stylesheet" href="estilo.css">
+  <link rel="manifest" href="manifest.webmanifest">
+  <meta name="theme-color" content="#1D9E75">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="RETIfica">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+</head>
+<body>
+  <main id="app"></main>
+  <div id="modal" class="modal" hidden></div>
+  <div id="aviso" class="aviso" hidden></div>
+  <script src="fflate.umd.js"></script>
+  <script src="xlsx-min.js"></script>
+  <script src="cdrf-core.js"></script>
+  <script src="app.js"></script>
+  <script>
+    // guarda o app no aparelho: depois da primeira vez, abre sem internet
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('sw.js').catch(function () { /* sem offline, mas funciona */ });
+      });
+    }
+  </script>
+</body>
+</html>
