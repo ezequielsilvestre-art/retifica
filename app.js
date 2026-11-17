@@ -1,14 +1,21 @@
 /* app.js — a tela do CDRF Campo. A lógica de verdade está em cdrf-core.js
  * (portada do programa Python). Tudo fica guardado no próprio aparelho:
- * não há nenhuma chamada de rede. */
+ * não há nenhuma chamada de rede.
+ *
+ * O app NÃO depende de pacote do PC. As regras do CDRF vêm embutidas
+ * (regras-cdrf.js); municípios, núcleos, ruas, valores padrão, códigos e
+ * sugestões ele APRENDE recebendo uma planilha pronta (Receber planilha),
+ * sempre mostrando antes o que vai mudar para você decidir. */
 (function () {
   'use strict';
   const C = window.CDRF;
-  const VERSAO_APP = '1.1';
+  const A = window.CDRF_APRENDER;
+  const VERSAO_APP = '2.0';
   const PFX = 'cdrf.c|';
 
   // ───────── estado e armazenamento local ─────────
-  const S = { P: null, base: null, extra: { municipios: {}, nucleos: {}, ruas: {}, padrao: {} }, cad: {}, sel: '', exp: {}, undo: null,
+  const extraVazio = () => ({ municipios: {}, nucleos: {}, ruas: {}, padrao: {}, existentes: {}, sugestoes: {}, extensiveis: {} });
+  const S = { P: null, base: null, extra: extraVazio(), cad: {}, sel: '', exp: {}, undo: null,
     tela: 'inicio', g: null, aberto: null, busca: '', fquadra: 'todas', fmostrar: 'todos', marcados: new Set() };
 
   const ler = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
@@ -18,49 +25,96 @@
   }
   function apagarChave(k) { try { localStorage.removeItem(k); } catch (e) { /* nada */ } }
 
-  // ───────── dados efetivos: pacote do PC + o que foi criado neste aparelho ─────────
+  // ───────── dados efetivos: regras do CDRF + o que o aparelho aprendeu e cadastrou ─────────
   const colideFaixa = (a, b) => {
     const ai = parseInt(a.lote_ini, 10), af = parseInt(a.lote_fim, 10);
     const bi = parseInt(b.lote_ini, 10), bf = parseInt(b.lote_fim, 10);
     if ([ai, af, bi, bf].some(Number.isNaN)) return false;
     return ai <= bf && bi <= af;
   };
+  const porLoteIni = (a, b) => (parseInt(a.lote_ini, 10) || 0) - (parseInt(b.lote_ini, 10) || 0);
   function mesclarExtras() {
-    const B = S.base;
-    if (!B) { S.P = null; return; }
-    const P = Object.assign({}, B);
-    const mun = JSON.parse(JSON.stringify(B.municipios || { municipios: {}, nucleos: {} }));
-    mun.municipios = mun.municipios || {}; mun.nucleos = mun.nucleos || {};
-    const nuc = Object.assign({}, B.nucleos || {});
-    for (const [m, i] of Object.entries(S.extra.municipios || {})) if (!mun.municipios[m]) mun.municipios[m] = i;
-    for (const [k, i] of Object.entries(S.extra.nucleos || {})) {
-      if (nuc[k]) continue;
-      nuc[k] = i; mun.nucleos[k] = { nome: i.nome, municipio: i.municipio };
-      if (!mun.municipios[i.municipio]) mun.municipios[i.municipio] = {};
-    }
-    // mapa de ruas: as faixas cadastradas no aparelho valem; as do PC entram onde não colidem
+    const R = S.base;
+    if (!R) { S.P = null; return; }
+    const P = Object.assign({}, R);
+    const mun = { municipios: {}, nucleos: {} }, nuc = {};
+    for (const [m, i] of Object.entries(S.extra.municipios || {})) mun.municipios[m] = Object.assign({}, i);
+    const registrar = (k, nome) => {
+      const [m, n] = C.partesDaChave(k);
+      if (!m || !n) return;
+      nuc[k] = { municipio: m, nuic: n, nome: nome || '' };
+      mun.nucleos[k] = { nome: nome || '', municipio: m };
+      if (!mun.municipios[m]) mun.municipios[m] = {};
+    };
+    for (const [k, i] of Object.entries(S.extra.nucleos || {})) registrar(C.chaveNucleo(i.municipio || C.partesDaChave(k)[0], i.nuic || C.partesDaChave(k)[1]), i.nome);
     const mapa = { nucleos: {} };
-    for (const [k, info] of Object.entries((B.mapa || {}).nucleos || {})) mapa.nucleos[k] = { quadras: Object.assign({}, info.quadras || {}) };
+    const voc = { rua: new Set(), bairro: new Set(), cep: new Set(), cidade: new Set(), estado: new Set() };
     for (const [k, quadras] of Object.entries(S.extra.ruas || {})) {
-      const alvo = (mapa.nucleos[k] = mapa.nucleos[k] || { quadras: {} });
-      for (const [qd, faixas] of Object.entries(quadras)) {
-        const doPC = (alvo.quadras[qd] || []).filter((p) => !faixas.some((a) => colideFaixa(a, p)));
-        alvo.quadras[qd] = faixas.concat(doPC).sort((a, b) => (parseInt(a.lote_ini, 10) || 0) - (parseInt(b.lote_ini, 10) || 0));
+      const q2 = {};
+      for (const [qd, f] of Object.entries(quadras || {})) {
+        if (!f || !f.length) continue;
+        q2[qd] = f.slice().sort(porLoteIni);
+        f.forEach((fx) => Object.keys(voc).forEach((c) => { const v = C.str(fx[c]).trim(); if (v && v !== '***') voc[c].add(v); }));
       }
+      mapa.nucleos[k] = { quadras: q2 };
+      if (!nuc[k]) registrar(k, '');                // núcleo que só tem ruas também aparece
     }
-    P.municipios = mun; P.nucleos = nuc; P.mapa = mapa; S.P = P;
+    // autocompletar: o que o mapa de ruas tem (como o PC) + o que veio nas planilhas
+    const catalogo = {};
+    for (const [grupo, campo] of Object.entries(R.cat_mapa || {})) {
+      let l = Array.from(voc[campo] || []);
+      if (grupo === 'municipio') l = l.concat(Object.keys(mun.municipios));
+      if (grupo === 'estado') l = l.concat(R.estados || []);
+      catalogo[grupo] = Array.from(new Set(l)).sort();
+    }
+    catalogo.nacionalidade = ((R.catalogo_fixo || {}).nacionalidade || []).slice();
+    Object.assign(P, { municipios: mun, nucleos: nuc, mapa, catalogo, padrao: {},
+      sugestoes_grupo: S.extra.sugestoes || {}, sugestoes_extensiveis: S.extra.extensiveis || {}, existentes: S.extra.existentes || {} });
+    S.P = P;
   }
   const gravarExtra = () => gravar('cdrf.extra', JSON.stringify(S.extra));
 
+  // Versões até a 1.1 guardavam um "pacote do PC" no aparelho. Os dados dele (núcleos, ruas,
+  // valores padrão…) passam a ser dados do próprio aparelho, sem perder nada; o pacote some.
+  function migrarPacoteAntigo() {
+    let p = null;
+    try { p = JSON.parse(ler('cdrf.pacote') || 'null'); } catch (e) { p = null; }
+    if (!p || !p.questoes) return;
+    const x = S.extra;
+    for (const [m, i] of Object.entries((p.municipios || {}).municipios || {})) {
+      const at = (x.municipios[m] = x.municipios[m] || {});
+      for (const [c, v] of Object.entries(i || {})) if (v && !at[c]) at[c] = v;
+    }
+    for (const [k, i] of Object.entries(p.nucleos || {})) {
+      const at = x.nucleos[k];
+      if (!at) x.nucleos[k] = { municipio: i.municipio, nuic: i.nuic, nome: i.nome || '' };
+      else if (!at.nome && i.nome) at.nome = i.nome;
+    }
+    for (const [k, info] of Object.entries((p.mapa || {}).nucleos || {})) {
+      const alvo = (x.ruas[k] = x.ruas[k] || {});
+      for (const [qd, faixas] of Object.entries(info.quadras || {})) {
+        const minhas = (alvo[qd] = alvo[qd] || []);
+        faixas.forEach((fx) => { if (!minhas.some((a) => colideFaixa(a, fx))) minhas.push(Object.assign({}, fx)); });
+      }
+    }
+    const global = {};
+    Object.entries(p.padrao || {}).forEach(([c, v]) => { if (v && c !== 'municipio' && c !== 'nucleo_nome') global[c] = v; });
+    if (Object.keys(global).length) {
+      Object.keys(x.nucleos).forEach((k) => { x.padrao[k] = Object.assign({}, global, x.padrao[k] || {}); });
+    }
+    for (const [k, cods] of Object.entries(p.existentes || {})) x.existentes[k] = Array.from(new Set((x.existentes[k] || []).concat(cods)));
+    for (const [g, vals] of Object.entries(p.sugestoes_grupo || {})) x.sugestoes[g] = Array.from(new Set((x.sugestoes[g] || []).concat(vals))).sort();
+    for (const [q, vals] of Object.entries(p.sugestoes_extensiveis || {})) x.extensiveis[q] = Array.from(new Set((x.extensiveis[q] || []).concat(vals))).sort();
+    if (gravarExtra()) apagarChave('cdrf.pacote');
+  }
+
   function carregar() {
-    try { S.base = JSON.parse(ler('cdrf.pacote') || 'null'); } catch (e) { S.base = null; }
-    // Dados embutidos no APK (pacote-embutido.js): valem se forem mais novos que os guardados no aparelho.
-    const E = window.CDRF_PACOTE;
-    if (E && E.versao === 1 && (!S.base || String(E.gerado_em) > String(S.base.gerado_em))) { S.base = E; gravar('cdrf.pacote', JSON.stringify(E)); }
+    S.base = window.CDRF_REGRAS && window.CDRF_REGRAS.questoes ? window.CDRF_REGRAS : null;
     try {
       const x = JSON.parse(ler('cdrf.extra') || 'null');
-      if (x) S.extra = { municipios: x.municipios || {}, nucleos: x.nucleos || {}, ruas: x.ruas || {}, padrao: x.padrao || {} };
+      if (x) S.extra = Object.assign(extraVazio(), x);
     } catch (e) { /* ok */ }
+    migrarPacoteAntigo();
     mesclarExtras();
     S.sel = ler('cdrf.sel') || '';
     try { S.exp = JSON.parse(ler('cdrf.exp') || '{}') || {}; } catch (e) { S.exp = {}; }
@@ -162,13 +216,16 @@
     const topo = topoApp();
     const corpo = h('div', { class: 'corpo' });
     if (!P) {
-      const inp = h('input', { type: 'file', hidden: true, onchange: onPacote });
-      corpo.append(h('div', { class: 'card alerta' }, h('h2', {}, 'Faltam os dados do núcleo'),
-        h('p', { class: 'suave' }, 'Este app deveria vir com os dados embutidos. Se não vieram, gere o pacote no computador (GERAR_PACOTE_CAMPO.bat) e carregue o arquivo pacote_campo.json aqui.'),
-        h('button', { class: 'primario', onclick: () => inp.click() }, 'Carregar pacote de campo'), inp));
+      corpo.append(h('div', { class: 'card alerta' }, h('h2', {}, 'Faltam as regras do CDRF'),
+        h('p', { class: 'suave' }, 'O arquivo regras-cdrf.js não foi carregado. Instale o app de novo.')));
       mostrar(topo, corpo); return;
     }
     const todos = listaTodos(), noLocal = doLocal(n), ult = S.exp[S.sel || '_'], sem = semLocalDoNucleo(n);
+    if (!listaNucleos().length && !todos.length) {
+      corpo.append(h('div', { class: 'card' }, h('h2', {}, 'Comece recebendo uma planilha'),
+        h('p', { class: 'suave', style: 'margin-top:0' }, 'Este aparelho ainda não conhece nenhum município, núcleo ou rua. Receba uma planilha pronta (no formato do banco do CDRF, feita no PC ou em outro celular): o app aprende com ela os municípios, os núcleos, as ruas de cada quadra, os valores padrão e os cadastros — e mostra tudo antes, para você decidir. Também dá para começar do zero, escolhendo o Local de trabalho.'),
+        h('button', { class: 'primario', onclick: escolherPlanilha }, ico('importar'), 'Receber planilha')));
+    }
     corpo.append(h('div', { class: 'card local' + (n ? '' : ' alerta'), onclick: () => telaLocal() },
       h('div', { class: 'suave' }, 'Local de trabalho'),
       h('div', { class: 'localtxt' }, n ? rotuloNucleo(n) : 'Não definido — toque para escolher o município e o núcleo')));
@@ -177,14 +234,15 @@
     corpo.append(h('div', { class: 'grade-tiles' },
       tile('novo', 'Novo cadastro', 'Ficha de um beneficiário, passo a passo', () => telaNovo(), { primario: true, largo: true }),
       tile('cadastros', 'Cadastros', todos.length ? `${todos.length} neste aparelho` : 'Nenhum ainda', () => telaCadastros()),
+      tile('importar', 'Receber planilha', 'Aprende núcleos, ruas e cadastros', escolherPlanilha),
       tile('config', 'Aplicar configuração', 'Completa o que falta nos cadastros', () => telaAplicar(), { desligado: !todos.length }),
       tile('ruas', 'Ruas e quadras', 'Faixas de lote do núcleo', () => telaRuas()),
       tile('prefeitura', 'Lotes da prefeitura', 'Lotes que faltam na quadra', () => telaPrefeitura()),
       tile('padron_tudo', 'Padronizar todos', 'Acentos, CPF, CEP, telefone', () => padronizarTodos(), { desligado: !todos.length }),
       tile('exportar', 'Exportar planilha', ult ? `Última: ${fmtData(ult.em)}` : (noLocal.length ? `${noLocal.length} cadastro(s)` : 'Nada para exportar'), exportar, { desligado: !noLocal.length })));
-    if (S.undo && (S.undo.cads || []).length) {
+    if (temUndo()) {
       corpo.append(h('button', { class: 'mini', onclick: desfazerAplicacao }, ico('desfazer'),
-        `Desfazer: ${S.undo.tipo} (${S.undo.n} campo(s))`));
+        `Desfazer: ${S.undo.tipo} (${S.undo.n} ${S.undo.receber ? 'mudança(s)' : 'campo(s)'})`));
     }
     const dias = ult ? Math.floor((Date.now() - new Date(ult.em).getTime()) / 86400000) : null;
     if (noLocal.length && (dias === null || dias >= 3)) {
@@ -192,7 +250,7 @@
         dias === null ? 'Você ainda não exportou nenhuma planilha. Exporte ao fim do dia: é a cópia do trabalho fora do aparelho.'
           : `Última exportação há ${dias} dias. Exporte de novo para não deixar o trabalho só neste aparelho.`));
     }
-    corpo.append(h('div', { class: 'suave' }, 'A planilha exportada é importada no programa do PC (menu 6 → Importar). Tudo fica só neste aparelho; não usa internet.'));
+    corpo.append(h('div', { class: 'suave' }, 'A planilha exportada pode ser recebida no programa do PC ou em outro celular (Receber planilha). Tudo fica só neste aparelho; não usa internet.'));
     mostrar(topo, corpo);
   }
 
@@ -245,18 +303,16 @@
       h('button', { class: 'mini', onclick: () => { S.sel = ''; gravar('cdrf.sel', ''); aviso('Sem local de trabalho.'); telaInicio(); } }, 'Trabalhar sem local (só com o código)'));
     if (atual) {
       const vn = { nome: atual.nome || '' };
-      const doApp = !!(S.extra.nucleos || {})[atual.chave];
       corpo.append(h('div', { class: 'card' }, h('h2', {}, 'Núcleo de agora'),
         h('p', { class: 'suave', style: 'margin-top:0' }, rotuloNucleo(atual)),
-        doApp ? h('div', {}, h('label', {}, 'Nome do núcleo (vai na coluna 73 da planilha)'),
+        h('div', {}, h('label', {}, 'Nome do núcleo (vai na coluna 73 da planilha)'),
           h('input', { type: 'text', value: vn.nome, autocomplete: 'off', oninput: (e) => { vn.nome = e.target.value; } }),
-          h('button', { class: 'mini', style: 'margin-top:8px', onclick: () => renomearNucleo(atual.chave, vn.nome) }, 'Salvar o nome')) : '',
+          h('button', { class: 'mini', style: 'margin-top:8px', onclick: () => renomearNucleo(atual.chave, vn.nome) }, 'Salvar o nome')),
         h('button', { class: 'mini', style: 'margin-top:10px', onclick: () => telaPadrao() }, ico('config'), 'Valores padrão deste núcleo')));
     }
-    const inpP = h('input', { type: 'file', hidden: true, onchange: onPacote });
-    corpo.append(h('div', { class: 'card' }, h('h2', {}, 'Dados vindos do PC'),
-      h('p', { class: 'suave' }, 'Gerados em ' + fmtData(S.P.gerado_em.replace(' ', 'T')) + '. Mudou rua ou núcleo no PC? Gere o pacote lá e carregue aqui, ou instale um APK novo.'),
-      h('button', { class: 'mini', onclick: () => inpP.click() }, 'Carregar pacote_campo.json'), inpP));
+    corpo.append(h('div', { class: 'card' }, h('h2', {}, 'Aprender de uma planilha'),
+      h('p', { class: 'suave', style: 'margin-top:0' }, 'Recebeu uma planilha pronta do PC ou de outro celular? O app aprende com ela municípios, núcleos, ruas, valores padrão e cadastros — e mostra antes o que muda, para você decidir.'),
+      h('button', { class: 'mini', onclick: escolherPlanilha }, ico('importar'), 'Receber planilha')));
     mostrar(topoApp('Local de trabalho'), corpo);
     try { history.pushState({ t: 'local' }, ''); } catch (e) { /* ok */ }
   }
@@ -277,17 +333,31 @@
     }
     gravarExtra(); mesclarExtras();
     S.sel = chave; gravar('cdrf.sel', S.sel);
-    const n = sincronizarVazios();
-    aviso('Local de trabalho definido.' + (n ? ` ${n} campo(s) completado(s).` : ''));
-    telaInicio();
+    aviso('Local de trabalho definido.');
+    oferecerAplicar([chave], 'O local de trabalho mudou. Estes campos dos cadastros já feitos neste núcleo mudariam:', () => telaInicio());
   }
   function renomearNucleo(chave, nome) {
-    const e = (S.extra.nucleos || {})[chave];
-    if (!e) return;
+    const [m, n] = C.partesDaChave(chave);
+    const e = (S.extra.nucleos[chave] = S.extra.nucleos[chave] || { municipio: m, nuic: n, nome: '' });
     e.nome = String(nome || '').trim();
     gravarExtra(); mesclarExtras();
     aviso(e.nome ? 'Nome do núcleo salvo.' : 'Núcleo sem nome.');
     telaLocal();
+  }
+
+  // Mudou a configuração (local, rua, valor padrão, planilha recebida)? Os cadastros já feitos daquele
+  // núcleo NÃO mudam sozinhos: se algo mudaria neles, mostra a lista para você decidir.
+  const cadsDoNucleo = (chave) => {
+    const [m, n] = C.partesDaChave(chave);
+    return listaTodos().filter((c) => nuicDe(c) === n && (!c.municipio || c.municipio === m));
+  };
+  function oferecerAplicar(chaves, motivo, depois) {
+    const vistos = new Set(), lista = [];
+    (chaves || []).forEach((k) => cadsDoNucleo(k).forEach((c) => { if (!vistos.has(c.key)) { vistos.add(c.key); lista.push(c); } }));
+    const { mud, conf } = calcularReaplicacao(lista);
+    if (!mud.length && !conf.length) { if (depois) depois(); return false; }
+    telaAplicar(lista, 'Aplicar nos cadastros já feitos', { motivo, voltar: depois || (() => telaInicio()), depois: depois || (() => telaInicio()) });
+    return true;
   }
 
   // ───────── valores padrão do loteamento, por núcleo (menu 4 do programa) ─────────
@@ -299,7 +369,7 @@
     S.tela = 'padrao';
     const atual = padraoDaChave(n.chave), v = Object.assign({}, atual);
     const corpo = h('div', { class: 'corpo' }, botaoVoltar(() => telaLocal(), '◂ Local'),
-      h('p', { class: 'suave', style: 'margin:0' }, 'O que é igual no núcleo inteiro. Vale para os próximos cadastros e entra nos já feitos por “Aplicar configuração”. Começa com o que veio do PC.'));
+      h('p', { class: 'suave', style: 'margin:0' }, 'O que é igual no núcleo inteiro. Vale para os próximos cadastros; nos já feitos, o app mostra o que mudaria antes de aplicar. Pode vir de uma planilha recebida.'));
     const card = h('div', { class: 'card' });
     (S.P.q_padrao || []).forEach(([chave, q]) => {
       const def = S.P.questoes[String(q)] || {};
@@ -316,14 +386,13 @@
     try { history.pushState({ t: 'padrao' }, ''); } catch (e) { /* ok */ }
   }
   function salvarPadrao(chave, v) {
-    const base = S.P.padrao || {}, so = {};
-    Object.entries(v).forEach(([k, val]) => { if (String(val || '') !== String(base[k] || '')) so[k] = String(val || ''); });
+    const so = {};
+    Object.entries(v).forEach(([k, val]) => { if (String(val || '').trim()) so[k] = String(val).trim(); });
     S.extra.padrao = S.extra.padrao || {};
     if (Object.keys(so).length) S.extra.padrao[chave] = so; else delete S.extra.padrao[chave];
     gravarExtra();
-    const n = sincronizarVazios();
-    aviso('Valores padrão salvos.' + (n ? ` ${n} campo(s) completado(s).` : ''));
-    telaLocal();
+    aviso('Valores padrão salvos.');
+    oferecerAplicar([chave], 'Os valores padrão do núcleo mudaram. Nos cadastros já feitos, estes campos mudariam:', () => telaLocal());
   }
 
   async function usarLocalNosSemLocal() {
@@ -533,10 +602,21 @@
     S.undo = { em: new Date().toISOString(), tipo, cads: antes, n };
     gravar('cdrf.undo', JSON.stringify(S.undo));
   }
+  const temUndo = () => !!(S.undo && ((S.undo.cads || []).length || S.undo.receber));
   async function desfazerAplicacao() {
-    if (!S.undo || !(S.undo.cads || []).length) return;
-    if (!(await confirmar('Desfazer', `Desfazer a última ação?\n\n${S.undo.tipo} (${S.undo.n} campo(s))\n\nOs cadastros voltam como estavam antes dela.`, 'Desfazer', 'Cancelar'))) return;
-    S.undo.cads.forEach((x) => { const c = S.cad[x.key]; if (!c) return; c.respostas = x.respostas; salvarCad(x.key); });
+    if (!temUndo()) return;
+    const R = S.undo.receber;
+    const msg = R
+      ? `Desfazer o recebimento da planilha?\n\n${S.undo.n} mudança(s)${R.novos.length ? `, ${R.novos.length} cadastro(s) novo(s) (serão apagados)` : ''}.\n\nNúcleos, ruas, valores padrão e cadastros voltam como estavam antes.`
+      : `Desfazer a última ação?\n\n${S.undo.tipo} (${S.undo.n} campo(s))\n\nOs cadastros voltam como estavam antes dela.`;
+    if (!(await confirmar('Desfazer', msg, 'Desfazer', 'Cancelar'))) return;
+    if (R) {
+      S.extra = Object.assign(extraVazio(), R.extra); gravarExtra(); mesclarExtras();
+      R.novos.forEach((k) => { delete S.cad[k]; apagarChave(PFX + k); });
+      Object.entries(R.cads || {}).forEach(([k, c]) => { S.cad[k] = c; salvarCad(k); });
+      if (S.sel && !nucleoAtual()) { S.sel = ''; gravar('cdrf.sel', ''); }
+    }
+    (S.undo.cads || []).forEach((x) => { const c = S.cad[x.key]; if (!c) return; c.respostas = x.respostas; salvarCad(x.key); });
     const t = S.undo.tipo;
     S.undo = null; apagarChave('cdrf.undo');
     aviso(`Ação desfeita: ${t}.`); telaInicio();
@@ -610,9 +690,8 @@
     if (!n) { telaLocal('Escolha o município e o núcleo para cadastrar as ruas.'); return; }
     S.tela = 'ruas';
     const quadras = C.quadrasDoNucleo(S.P.mapa, n.chave);
-    const minhas = ruasDoAparelho(n.chave);
     const corpo = h('div', { class: 'corpo' }, botaoVoltar(),
-      h('p', { class: 'suave', style: 'margin:0' }, 'Cada faixa diz qual rua atende um intervalo de lotes da quadra. É daqui que o endereço do imóvel é preenchido sozinho. O que você cadastrar aqui vai junto na planilha, para o PC guardar no mapa de ruas.'),
+      h('p', { class: 'suave', style: 'margin:0' }, 'Cada faixa diz qual rua atende um intervalo de lotes da quadra. É daqui que o endereço do imóvel é preenchido. As faixas vêm das planilhas recebidas ou são cadastradas aqui, e vão junto na planilha exportada.'),
       h('button', { class: 'primario', onclick: () => telaFaixa(n.chave, '', null) }, '＋  Nova faixa de lotes'));
     const nomes = Object.keys(quadras).sort();
     if (!nomes.length) corpo.append(h('div', { class: 'card alerta' }, 'Nenhuma rua cadastrada neste núcleo ainda.'));
@@ -620,10 +699,8 @@
       const faixas = quadras[qd] || [];
       const bloco = h('div', { class: 'card' }, h('h2', {}, 'Quadra ' + C.quadraVisivel(qd)));
       faixas.forEach((fx) => {
-        const doApp = (minhas[qd] || []).includes(fx);
         bloco.append(h('div', { class: 'faixa', onclick: () => telaFaixa(n.chave, qd, fx) },
-          h('div', { class: 'fl' }, `Lotes ${String(fx.lote_ini).padStart(2, '0')}–${String(fx.lote_fim).padStart(2, '0')}`,
-            doApp ? h('span', { class: 'chip atencao' }, 'deste aparelho') : ''),
+          h('div', { class: 'fl' }, `Lotes ${String(fx.lote_ini).padStart(2, '0')}–${String(fx.lote_fim).padStart(2, '0')}`),
           h('div', {}, fx.rua || '(sem rua)'),
           h('div', { class: 'suave' }, [fx.bairro, fx.cep, fx.cidade].filter(Boolean).join(' · '))));
       });
@@ -676,9 +753,8 @@
     }
     (minhas[qd] = minhas[qd] || []).push(nova);
     gravarExtra(); mesclarExtras();
-    const nn = sincronizarVazios();
-    aviso('Faixa salva.' + (nn ? ` ${nn} campo(s) completado(s) nos cadastros.` : ''));
-    telaRuas();
+    aviso('Faixa salva.');
+    oferecerAplicar([chave], `A rua da quadra ${C.quadraVisivel(qd)} mudou. Nos cadastros já feitos, estes campos mudariam:`, () => telaRuas());
   }
   async function excluirFaixa(chave, quadra, fx) {
     if (!(await confirmar('Excluir faixa', `Apagar a faixa de lotes ${fx.lote_ini}–${fx.lote_fim} (${fx.rua})?`, 'Excluir', 'Cancelar'))) return;
@@ -752,7 +828,7 @@
       if (S.cad[key]) return;
       const r = C.cascataAplicar(S.P, x.codigo, { municipio: n.municipio, padrao: padraoDaChave(n.chave) });
       const resp = r.respostas;
-      Object.assign(resp, { 3: mun.prefeitura || ('Prefeitura Municipal de ' + n.municipio), 8: mun.cnpj || '', 14: 'Pessoa Jurídica',
+      Object.assign(resp, { 3: mun.prefeitura || ('Prefeitura Municipal de ' + n.municipio), 8: mun.cnpj || '', 14: 'pessoa jurídica',
         33: mun.logradouro || '', 34: mun.numero || '', 35: mun.bairro || '', 36: n.municipio, 37: mun.estado || '', 38: mun.cep || '' });
       if (!C.vazio(resp, 52)) Object.assign(resp, { 53: '***', 54: '***', 55: '***' });
       S.cad[key] = { municipio: n.municipio, codigo: x.codigo, respostas: resp, origens: r.origens, criado: new Date().toISOString(), prefeitura: true };
@@ -780,27 +856,15 @@
     const ord = (a, b) => (a.cod < b.cod ? -1 : a.cod > b.cod ? 1 : (+a.q) - (+b.q));
     return { mud: mud.sort(ord), conf: conf.sort(ord) };
   }
-  // o que o editor do PC faz sozinho ao voltar de outra tela: preenche os VAZIOS, sem perguntar
-  function sincronizarVazios(lista) {
-    const alvo = lista || listaTodos();
-    if (!alvo.length) return 0;
-    const { mud } = calcularReaplicacao(alvo);
-    if (!mud.length) return 0;
-    const chaves = Array.from(new Set(mud.map((i) => i.key)));
-    const antes = instantaneo(chaves.map((k) => Object.assign({ key: k }, S.cad[k])));
-    mud.forEach((i) => {
-      const c = S.cad[i.key]; if (!c) return;
-      c.respostas[i.q] = i.novo; (c.origens || (c.origens = {}))[i.q] = i.origem || 'Aplicar configuração';
-    });
-    chaves.forEach((k) => salvarCad(k));
-    registrarUndo('completar campos vazios', antes, mud.length);
-    return mud.length;
-  }
-  function telaAplicar(lista, titulo) {
+  // opc = {motivo, voltar, depois}: usado quando uma mudança de configuração pede para revisar os cadastros
+  function telaAplicar(lista, titulo, opc) {
     S.tela = 'aplicar';
+    opc = opc || {};
     const alvo = lista || (S.marcados.size ? marcados() : listaTodos());
     const { mud, conf } = calcularReaplicacao(alvo);
-    const voltar = titulo ? botaoVoltar(() => telaCadastro(alvo[0].key), '◂ Cadastro') : botaoVoltar();
+    const umCad = titulo && !opc.voltar && alvo.length === 1;
+    const voltar = opc.voltar ? botaoVoltar(opc.voltar, '◂ Agora não') : (umCad ? botaoVoltar(() => telaCadastro(alvo[0].key), '◂ Cadastro') : botaoVoltar());
+    const depois = opc.depois || (umCad ? () => telaCadastro(alvo[0].key) : () => telaInicio());
     if (!mud.length && !conf.length) {
       mostrar(topoApp(titulo || 'Aplicar configuração'), h('div', { class: 'corpo' }, voltar,
         h('div', { class: 'card' }, h('h2', {}, 'Nada a fazer'),
@@ -824,13 +888,14 @@
     atualiza();
     const todos = (m) => { itens.forEach((i) => { i.marcado = m; }); caixa.querySelectorAll('input').forEach((x) => { x.checked = m; }); atualiza(); };
     mostrar(topoApp(titulo || `Aplicar configuração · ${alvo.length} cadastro(s)`), h('div', { class: 'corpo' }, voltar,
+      opc.motivo ? h('div', { class: 'card alerta' }, opc.motivo) : '',
       h('div', { class: 'suave' }, EXPLICA_CONFIG), caixa, resumo,
       h('div', { class: 'linha' }, h('button', { onclick: () => todos(true) }, 'Marcar todos'), h('button', { onclick: () => todos(false) }, 'Desmarcar todos')),
-      h('button', { class: 'primario', onclick: () => gravarReaplicacao(itens.filter((i) => i.marcado), titulo ? alvo[0].key : null) }, 'Aplicar os marcados')));
+      h('button', { class: 'primario', onclick: () => gravarReaplicacao(itens.filter((i) => i.marcado), depois) }, 'Aplicar os marcados')));
     try { history.pushState({ t: 'aplicar' }, ''); } catch (e) { /* ok */ }
   }
-  function gravarReaplicacao(sel, voltarPara) {
-    if (!sel.length) { aviso('Nada marcado.'); return; }
+  function gravarReaplicacao(sel, depois) {
+    if (!sel.length) { aviso('Nada marcado — nenhum cadastro mudou.'); depois(); return; }
     const chaves = Array.from(new Set(sel.map((i) => i.key)));
     const antes = instantaneo(chaves.map((k) => Object.assign({ key: k }, S.cad[k])));
     sel.forEach((i) => {
@@ -840,19 +905,188 @@
     chaves.forEach((k) => salvarCad(k));
     registrarUndo('aplicar configuração', antes, sel.length);
     aviso(`${sel.length} campo(s) atualizado(s) em ${chaves.length} cadastro(s).`);
-    if (voltarPara) telaCadastro(voltarPara); else telaInicio();
+    depois();
   }
 
-  async function onPacote(ev) {
-    const f = ev.target.files && ev.target.files[0]; if (!f) return;
+  // ───────── RECEBER PLANILHA: aprender com uma planilha pronta (formato do banco) ─────────
+  function escolherPlanilha() {
+    const inp = h('input', { type: 'file', accept: '.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', hidden: true });
+    inp.addEventListener('change', () => { const f = inp.files && inp.files[0]; inp.remove(); if (f) receberArquivo(f); });
+    document.body.append(inp);
+    inp.click();
+  }
+  // a aba "RUAS DO CAMPO" (que este app grava ao exportar) traz faixas inteiras, inclusive de lotes sem cadastro
+  function ruasDaAba(aba, prop) {
+    const L = aba.linhas || [];
+    if (!L.length) return 0;
+    const cab = L[0].map((x) => C.semAcento(x));
+    const ix = (nome) => cab.indexOf(nome);
+    const c = { mun: ix('municipio'), nuic: ix('nuic'), qd: ix('quadra'), ini: ix('lote inicial'), fim: ix('lote final'), rua: ix('rua'),
+      bairro: ix('bairro'), cep: ix('cep'), cidade: ix('cidade'), estado: ix('estado') };
+    if (c.mun < 0 || c.nuic < 0 || c.qd < 0 || c.ini < 0 || c.fim < 0 || c.rua < 0) return 0;
+    let n = 0;
+    for (const r of L.slice(1)) {
+      const g = (i) => (i < 0 ? '' : C.str(r[i]).trim());
+      const mun = g(c.mun), nuic = C.soDigitos(g(c.nuic)).padStart(2, '0'), qd = C.normalizarQuadra(g(c.qd));
+      const fx = { lote_ini: parseInt(g(c.ini), 10), lote_fim: parseInt(g(c.fim), 10), rua: g(c.rua), bairro: g(c.bairro), cep: g(c.cep), cidade: g(c.cidade), estado: g(c.estado) };
+      if (!mun || !qd || !fx.rua || Number.isNaN(fx.lote_ini) || Number.isNaN(fx.lote_fim)) continue;
+      const k = C.chaveNucleo(mun, nuic);
+      if (!prop.nucleos[k]) prop.nucleos[k] = { municipio: mun, nuic, nome: '' };
+      if (!prop.municipios[mun]) prop.municipios[mun] = fx.estado ? { estado: fx.estado } : {};
+      const quadras = (prop.ruas[k] = prop.ruas[k] || {});
+      // a faixa explícita vale mais que a deduzida dos cadastros
+      quadras[qd] = (quadras[qd] || []).filter((a) => !colideFaixa(a, fx)).concat([fx]).sort(porLoteIni);
+      n++;
+    }
+    return n;
+  }
+  async function receberArquivo(f) {
+    let prop, itens;
     try {
-      const p = JSON.parse(await f.text());
-      if (!(p && p.versao === 1 && p.questoes && p.colunas && p.mapa && p.municipios && p.nucleos)) throw new Error('formato');
-      if (!gravar('cdrf.pacote', JSON.stringify(p))) return;
-      S.base = p; mesclarExtras();
-      if (S.sel && !nucleoAtual()) { S.sel = ''; gravar('cdrf.sel', ''); }
-      aviso('Pacote carregado.'); telaInicio();
-    } catch (e) { avisarCaixa('Pacote inválido', 'Esse arquivo não é um pacote de campo do CDRF.\n\nGere de novo com GERAR_PACOTE_CAMPO.bat no computador.'); }
+      const bytes = new Uint8Array(await f.arrayBuffer());
+      const abas = XLSXLer.lerXlsx(bytes);
+      const tabela = A.tabelaDoBanco(abas[0].linhas);
+      prop = A.aprender(S.P, tabela);
+      const abaRuas = abas.find((a) => C.semAcento(a.nome) === 'ruas do campo');
+      const nRuasAba = abaRuas ? ruasDaAba(abaRuas, prop) : 0;
+      if (nRuasAba) prop.avisos.unshift(`A aba "RUAS DO CAMPO" trouxe ${nRuasAba} faixa(s) de rua cadastradas em outro aparelho.`);
+      itens = A.comparar(S.P, prop, {
+        municipios: (S.P.municipios || {}).municipios || {}, nucleos: S.P.nucleos || {}, mapa: S.P.mapa,
+        padrao: (k) => padraoDaChave(k), existentes: S.extra.existentes || {}, sugestoes: S.extra.sugestoes || {},
+        extensiveis: S.extra.extensiveis || {}, cadastros: listaTodos(),
+      });
+    } catch (e) {
+      await avisarCaixa('Receber planilha', 'Não consegui ler esta planilha.\n\n' + (e && e.message ? e.message : e));
+      return;
+    }
+    if (!prop.total) { await avisarCaixa('Receber planilha', 'A planilha não tem nenhum cadastro (coluna "(2) Nº Cadastral" vazia).'); return; }
+    if (!itens.length) {
+      await avisarCaixa('Receber planilha', `${f.name}\n\n${prop.total} cadastro(s) lido(s). Nada novo: este aparelho já tem tudo o que a planilha traz.`);
+      return;
+    }
+    telaReceber(f.name, prop, itens);
+  }
+
+  function telaReceber(nomeArq, prop, itens) {
+    S.tela = 'receber';
+    const nucs = Object.keys(prop.nucleos).map((k) => k.replace('|', ' · NUIC '));
+    const resumo = h('div', { class: 'suave' });
+    const atualiza = () => { resumo.textContent = `${itens.filter((i) => i.marcado).length} de ${itens.length} mudança(s) marcada(s).`; };
+    const corpo = h('div', { class: 'corpo' }, botaoVoltar(() => telaInicio(), '◂ Cancelar'),
+      h('div', { class: 'card' }, h('h2', {}, nomeArq),
+        h('p', { class: 'suave', style: 'margin:0' }, `${prop.total} cadastro(s) na planilha${nucs.length ? ' · ' + nucs.join(', ') : ''}.`),
+        h('p', { class: 'suave' }, 'Nada muda até você tocar em “Aplicar os marcados”. Vem marcado o que é novo ou completa algo vazio; vem DESMARCADO o que trocaria um valor que já existe neste aparelho.')));
+    if (prop.avisos.length) {
+      const lista = h('ul', { class: 'faltou' }, prop.avisos.map((a) => h('li', {}, a)));
+      const det = h('details', {}, h('summary', {}, `${prop.avisos.length} aviso(s) sobre a planilha`), lista);
+      corpo.append(h('div', { class: 'card alerta' }, det));
+    }
+    for (const [g, rot] of A.GRUPOS) {
+      const doGrupo = itens.filter((i) => i.grupo === g);
+      if (!doGrupo.length) continue;
+      const caixa = h('div', { class: 'reap' });
+      const cont = h('span', { class: 'suave' });
+      const contar = () => { cont.textContent = ` ${doGrupo.filter((i) => i.marcado).length}/${doGrupo.length}`; atualiza(); };
+      const desenhar = (limite) => {
+        caixa.replaceChildren(...doGrupo.slice(0, limite).map((it) => {
+          const cb = h('input', { type: 'checkbox', checked: it.marcado, onchange: (e) => { it.marcado = e.target.checked; contar(); } });
+          return h('label', { class: 'reapitem' + (it.marcado ? '' : ' conf') }, cb,
+            h('div', {}, h('div', {}, h('b', {}, it.titulo)),
+              it.atual !== '' && it.atual !== undefined ? h('div', { class: 'suave' }, `Está: ${it.atual}`) : (g === 'cadnovo' || /novo/.test(it.titulo) ? '' : h('div', { class: 'suave' }, 'Está: (vazio)')),
+              h('div', {}, `${g === 'cadnovo' ? 'Entra com' : 'Passa a ser'}: ${it.novo}`),
+              it.nota ? h('div', { class: 'suave' }, it.nota) : ''));
+        }));
+        if (doGrupo.length > limite) caixa.append(h('button', { class: 'mini', onclick: () => desenhar(doGrupo.length) }, `Mostrar os outros ${doGrupo.length - limite}`));
+      };
+      desenhar(40);
+      const marcarGrupo = (m) => { doGrupo.forEach((i) => { i.marcado = m; }); desenhar(caixa.querySelectorAll('.reapitem').length || 40); contar(); };
+      corpo.append(h('div', { class: 'card' },
+        h('div', { class: 'linha', style: 'align-items:center' }, h('h2', { style: 'margin:0;flex:3' }, rot, cont),
+          h('button', { class: 'mini', onclick: () => marcarGrupo(true) }, 'Todos'), h('button', { class: 'mini', onclick: () => marcarGrupo(false) }, 'Nenhum')),
+        caixa));
+      contar();
+    }
+    atualiza();
+    corpo.append(resumo, h('button', { class: 'primario', onclick: () => aplicarRecebimento(nomeArq, prop, itens.filter((i) => i.marcado)) }, 'Aplicar os marcados'));
+    mostrar(topoApp('Receber planilha'), corpo);
+    try { history.pushState({ t: 'receber' }, ''); } catch (e) { /* ok */ }
+  }
+
+  async function aplicarRecebimento(nomeArq, prop, sel) {
+    if (!sel.length) { aviso('Nada marcado — nada mudou.'); telaInicio(); return; }
+    const ordem = A.GRUPOS.map(([g]) => g);
+    sel = sel.slice().sort((a, b) => ordem.indexOf(a.grupo) - ordem.indexOf(b.grupo));
+    const x = S.extra;
+    const antesExtra = JSON.parse(JSON.stringify(x));
+    const antesCads = {}, novos = [], tocados = new Set(), nucleosMudados = new Set();
+    const guardar = (key) => { if (S.cad[key] && !(key in antesCads)) antesCads[key] = JSON.parse(JSON.stringify(S.cad[key])); };
+    const origem = `planilha recebida (${nomeArq})`;
+    for (const it of sel) {
+      const a = it.acao;
+      switch (a.tipo) {
+        case 'mun_novo': x.municipios[a.nome] = Object.assign({}, x.municipios[a.nome] || {}, a.dados); break;
+        case 'mun_campo': (x.municipios[a.nome] = x.municipios[a.nome] || {})[a.campo] = a.valor; break;
+        case 'nuc_novo': x.nucleos[a.chave] = { municipio: a.info.municipio, nuic: a.info.nuic, nome: a.info.nome || '' }; nucleosMudados.add(a.chave); break;
+        case 'nuc_nome': {
+          const [m, n] = C.partesDaChave(a.chave);
+          (x.nucleos[a.chave] = x.nucleos[a.chave] || { municipio: m, nuic: n, nome: '' }).nome = a.nome; nucleosMudados.add(a.chave); break;
+        }
+        case 'rua_nova': case 'rua_troca': {
+          const quadras = (x.ruas[a.chave] = x.ruas[a.chave] || {});
+          const limpa = {}; C.CAMPOS_FAIXA.forEach((c) => { limpa[c] = a.faixa[c] === undefined ? '' : a.faixa[c]; });
+          let l = quadras[a.quadra] || [];
+          if (a.tipo === 'rua_troca') l = l.filter((f) => !colideFaixa(f, limpa));
+          else if (l.some((f) => colideFaixa(f, limpa))) break;
+          quadras[a.quadra] = l.concat([limpa]).sort(porLoteIni);
+          nucleosMudados.add(a.chave); break;
+        }
+        case 'pad': (x.padrao[a.chave] = x.padrao[a.chave] || {})[a.campo] = a.valor; nucleosMudados.add(a.chave); break;
+        case 'cod': x.existentes[a.chave] = Array.from(new Set((x.existentes[a.chave] || []).concat(a.codigos))).sort(); break;
+        case 'sug':
+          for (const [g, v] of Object.entries(a.sugestoes)) x.sugestoes[g] = Array.from(new Set((x.sugestoes[g] || []).concat(v))).sort();
+          for (const [q, v] of Object.entries(a.extensiveis)) x.extensiveis[q] = Array.from(new Set((x.extensiveis[q] || []).concat(v))).sort();
+          break;
+        case 'cad_novo': {
+          const cad = a.cad, key = chaveCad(cad.municipio, cad.codigo);
+          if (S.cad[key]) break;
+          const origens = {}; Object.keys(cad.respostas).forEach((q) => { origens[q] = origem; });
+          S.cad[key] = { municipio: cad.municipio, codigo: cad.codigo, respostas: Object.assign({}, cad.respostas), origens,
+            idreg: cad.idreg || '', extras: Object.assign({}, cad.extras), criado: new Date().toISOString(), recebido: nomeArq };
+          novos.push(key); tocados.add(key); break;
+        }
+        case 'cad_troca': {
+          guardar(a.key); const c = S.cad[a.key]; if (!c) break;
+          const origens = {}; Object.keys(a.cad.respostas).forEach((q) => { origens[q] = origem; });
+          Object.assign(c, { respostas: Object.assign({}, a.cad.respostas), origens, idreg: a.cad.idreg || c.idreg || '',
+            extras: Object.assign({}, c.extras || {}, a.cad.extras), prefeitura: false });
+          tocados.add(a.key); break;
+        }
+        case 'cad_campo': { guardar(a.key); const c = S.cad[a.key]; if (!c) break; c.respostas[a.q] = a.valor; (c.origens || (c.origens = {}))[a.q] = origem; tocados.add(a.key); break; }
+        case 'cad_extra': { guardar(a.key); const c = S.cad[a.key]; if (!c) break; (c.extras = c.extras || {})[a.n] = a.valor; tocados.add(a.key); break; }
+        case 'cad_idreg': { guardar(a.key); const c = S.cad[a.key]; if (!c) break; c.idreg = a.valor; tocados.add(a.key); break; }
+        case 'graf': {
+          const key = a.key || chaveCad(a.municipio, a.codigo);
+          if (!a.key) { /* cadastro novo desta mesma planilha */ } else guardar(key);
+          const c = S.cad[key]; if (!c) break;
+          if (C.str(c.respostas[a.q]).trim() === a.de) { c.respostas[a.q] = a.para; tocados.add(key); }
+          break;
+        }
+        default: break;
+      }
+    }
+    if (!gravarExtra()) { S.extra = antesExtra; return; }
+    let falhou = 0;
+    tocados.forEach((k) => { if (S.cad[k] && !salvarCad(k)) falhou++; });
+    mesclarExtras();
+    S.undo = { em: new Date().toISOString(), tipo: 'receber planilha', n: sel.length, cads: [],
+      receber: { extra: antesExtra, cads: antesCads, novos } };
+    gravar('cdrf.undo', JSON.stringify(S.undo));
+    // sem local escolhido e a planilha é de um núcleo só: ele vira o local de trabalho
+    const nk = Object.keys(prop.nucleos);
+    if (!nucleoAtual() && nk.length === 1 && S.P.nucleos[nk[0]]) { S.sel = nk[0]; gravar('cdrf.sel', S.sel); }
+    aviso(`${sel.length} mudança(s) aplicada(s)` + (novos.length ? ` · ${novos.length} cadastro(s) novo(s)` : '') + (falhou ? ` · ⚠ ${falhou} não salvo(s)` : '') + '.');
+    // a configuração nova pode completar/mudar campos dos cadastros daqueles núcleos: mostra antes
+    oferecerAplicar(Array.from(nucleosMudados), 'A configuração aprendida da planilha mudou ruas, núcleos ou valores padrão. Nos cadastros deste aparelho, estes campos mudariam:', () => telaInicio());
   }
   // ───────── novo cadastro: o código ─────────
   function telaNovo() {
@@ -892,7 +1126,7 @@
     const ja = listaTodos().find((c) => c.codigo === cod && (!c.municipio || !municipio || c.municipio === municipio));
     if (ja) { await avisarCaixa('Novo cadastro', `O código ${cod} já existe aqui — vou abri-lo para edição.`); abrirGuiado(ja.key, primeiroVazio(ja)); return; }
     const jaNoPC = municipio && ((P.existentes || {})[C.chaveNucleo(municipio, nuic)] || []).includes(cod);
-    if (jaNoPC && !(await confirmar('Código já existe', `O código ${cod} já está na planilha-mãe do núcleo, no PC.\n\nSe criar aqui, na importação o programa só completa os campos que estiverem vazios lá (ou pergunta, conforme o modo escolhido).\n\nCriar mesmo assim?`, 'Criar', 'Voltar'))) return;
+    if (jaNoPC && !(await confirmar('Código já existe', `O código ${cod} já existe numa planilha recebida deste núcleo (PC ou outro celular).\n\nSe criar aqui, quem receber a sua planilha vai ver cada campo diferente como conflito, para decidir.\n\nCriar mesmo assim?`, 'Criar', 'Voltar'))) return;
 
     // CASCATA: o cadastro nasce com o que o caminho já respondeu (só o código basta; o resto completa depois)
     const r = C.cascataAplicar(P, cod, { municipio: municipio || null, padrao: padraoDaChave(C.chaveNucleo(municipio, nuic)) });
@@ -904,7 +1138,7 @@
   const traduzFaltou = (f) => (/^município do núcleo/.test(f)
     ? 'município e núcleo — defina o Local de trabalho e depois use “Aplicar configuração”'
     : /^endereço do imóvel/.test(f)
-      ? f.replace(/\s*\(cadastre no menu 3.*$/, '') + ' — digite rua, bairro e CEP no cadastro, ou cadastre a rua no PC (menu 3) e use “Aplicar configuração”'
+      ? f.replace(/\s*\(cadastre no menu 3.*$/, '') + ' — digite rua, bairro e CEP no cadastro, ou cadastre a faixa em “Ruas e quadras” (ou receba uma planilha com as ruas)'
       : f);
 
   function telaResumoNovo(key, n, faltou) {
@@ -1018,16 +1252,18 @@
   }
 
   function telaTerminou() {
-    const P = S.P, c = S.cad[S.g.key];
-    // padroniza sozinho ao fechar a ficha (o mesmo que o botão Padronizar faz)
-    const npad = C.padronizarRespostas(P, c.respostas);
-    if (npad) salvarCad(S.g.key);
+    const P = S.P, key = S.g.key, c = S.cad[key];
+    // NÃO padroniza sozinho: conta o que o Padronizar mudaria e deixa você decidir
+    const teste = JSON.parse(JSON.stringify(c.respostas));
+    const npad = C.padronizarRespostas(P, teste);
     const flux = C.fluxoDeCampos(P, c.respostas);
     const n = flux.filter((q) => !C.vazio(c.respostas, q)).length;
     mostrar(h('div', { class: 'topo' }, h('h1', {}, `Cadastro ${c.codigo}`)),
       h('div', { class: 'corpo' },
         h('div', { class: 'card' }, h('h2', {}, 'Ficha terminada'), h('p', { style: 'margin:0' }, `Terminou os ${flux.length} campos da ficha — ${n} preenchido(s).`),
-          h('p', { class: 'suave' }, npad ? `${npad} campo(s) padronizado(s) automaticamente (acentos, maiúsculas, CPF, CEP, telefone).` : ''),
+          npad ? h('div', { class: 'card alerta', style: 'margin-top:10px' },
+            h('div', {}, `${npad} campo(s) estão fora do padrão (acentos, maiúsculas, grafia do CDRF, CPF, CEP, telefone). Na planilha exportada a grafia das opções já sai certa.`),
+            h('button', { class: 'mini', style: 'margin-top:8px', onclick: () => { const k = padronizarLista([Object.assign({ key }, c)]); aviso(`${k} campo(s) padronizado(s).`); telaTerminou(); } }, ico('padron_este'), 'Padronizar agora')) : '',
           h('p', { class: 'suave' }, 'Colunas de cartório, registro e áreas são completadas no programa do PC.')),
         h('div', { class: 'linha' }, h('button', { onclick: () => abrirGuiado(S.g.key, flux[flux.length - 1]) }, '◂ Rever'), h('button', { class: 'primario', onclick: () => voltarDoGuiado() }, 'Concluir'))));
   }
@@ -1044,16 +1280,16 @@
       const parou = await fecharGuiado(true);
       if (!parou) { try { history.pushState({ t: 'guiado' }, ''); } catch (e) { /* ok */ } }
     } else if (S.tela === 'novo' || S.tela === 'resumo' || S.tela === 'cadastro') telaCadastros();
-    else if (['cadastros', 'local', 'aplicar', 'ruas', 'prefeitura', 'lote'].includes(S.tela)) telaInicio();
+    else if (['cadastros', 'local', 'aplicar', 'ruas', 'prefeitura', 'lote', 'receber'].includes(S.tela)) telaInicio();
     else if (S.tela === 'padrao') telaLocal();
     else if (S.tela === 'faixa') telaRuas();
   });
   document.addEventListener('visibilitychange', () => { if (document.hidden && S.g && S.cad[S.g.key]) { clearTimeout(tSalva); salvarCad(S.g.key); } });
 
   // ───────── exportar planilha ─────────
-  // Aba extra com as ruas cadastradas no aparelho. O programa do PC lê só a
-  // primeira aba, então isto não atrapalha a importação (menu 6); quem usa esta
-  // aba é o IMPORTAR_RUAS_DO_CAMPO.bat, que as grava no mapa de ruas.
+  // Aba extra com as ruas do aparelho. Os cadastros vão na primeira aba; esta
+  // serve para quem receber a planilha (PC ou celular) aprender as ruas — ela
+  // traz a faixa inteira, inclusive lotes ainda sem cadastro.
   function abaDeRuas(n) {
     const linhas = [];
     for (const [chave, quadras] of Object.entries(S.extra.ruas || {})) {
@@ -1107,7 +1343,7 @@
     const avisos = [];
     if (semMun) avisos.push(`${semMun} cadastro(s) sem município — defina o Local de trabalho antes, senão o PC não sabe de qual núcleo são.`);
     if (n && !n.nome) avisos.push('O núcleo está sem nome: a coluna 73 vai vazia e o menu 7 do PC não vai detectá-lo sozinho.');
-    if (nRuas) avisos.push(`${nRuas} faixa(s) de rua vão numa aba à parte — no PC use IMPORTAR_RUAS_DO_CAMPO.bat.`);
+    if (nRuas) avisos.push(`${nRuas} faixa(s) de rua vão numa aba à parte (RUAS DO CAMPO) — quem receber a planilha, no PC ou no celular, aprende as ruas com ela.`);
     if (incompletos) avisos.push(`${incompletos} cadastro(s) ainda têm campos em branco (dá para exportar assim e completar no PC).`);
     const msg = `${lista.length} cadastro(s)${n ? ' de ' + rotuloNucleo(n) : ''}.`
       + (avisos.length ? '\n\n' + avisos.map((a) => '• ' + a).join('\n') : '\n\nTudo certo.');

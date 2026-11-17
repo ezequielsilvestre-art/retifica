@@ -1,10 +1,11 @@
 // service worker do RETIfica: guarda o app no aparelho (cache primeiro).
 // A versão muda sozinha a cada publicação, e aí o app se atualiza.
-const VERSAO = 'retifica-99da19e56c';
+const VERSAO = 'retifica-25409572c6';
 const ARQUIVOS = [
   "./",
   "app.js",
   "apple-touch-icon.png",
+  "aprender.js",
   "cdrf-core.js",
   "estilo.css",
   "fflate.umd.js",
@@ -35,6 +36,8 @@ const ARQUIVOS = [
   "icones/salvar.png",
   "index.html",
   "manifest.webmanifest",
+  "regras-cdrf.js",
+  "xlsx-ler.js",
   "xlsx-min.js"
 ];
 self.addEventListener('install', (e) => {

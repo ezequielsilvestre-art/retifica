@@ -2,8 +2,9 @@
  *
  * Cada função diz de onde veio (módulo.função do programa). Nada aqui toca
  * na tela: serve ao app e aos testes (node) que comparam com o Python.
- * Todas as listas e regras (questões, opções, colunas, valores padrão)
- * vêm do PACOTE DE CAMPO gerado pelo programa — não há cópia à mão.
+ * As regras (questões, opções na grafia do CDRF, colunas) vêm de
+ * regras-cdrf.js, gerado do programa do PC; municípios, núcleos, ruas e
+ * valores padrão o app aprende recebendo planilhas (aprender.js).
  */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory();
@@ -212,9 +213,35 @@
   }
 
 
+  // ───────── grafia exata do CDRF oficial (opcoes_cdrf.py) ─────────
+  // O CDRF original compara as opções letra por letra (maiúscula ≠ minúscula):
+  // estado civil todo minúsculo, instrumento jurídico todo MAIÚSCULO etc.
+  // As listas, os sinônimos (formas antigas) e as trocas da planilha vêm do pacote.
+  function chaveOpcao(s) {                                             // OQ._chave_opcao
+    return semAcento(s).replace(/[º°ª]/g, ' ').replace(/[^a-z0-9/()]+/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+  function formaOficial(P, q, valor) {                                 // OQ.forma_oficial
+    const def = P.questoes[String(q)];
+    if (!def || def.tipo !== 'select') return valor;
+    const v = str(valor).trim();
+    if (!v || v === '***') return valor;
+    const k = chaveOpcao(v);
+    for (const op of def.opcoes || []) if (chaveOpcao(op) === k) return op;
+    const sin = (def.sinonimos || {})[k];
+    return sin !== undefined ? sin : valor;
+  }
+  function paraPlanilha(P, q, valor) {                                 // OQ.para_planilha
+    const of = formaOficial(P, q, valor);
+    const def = P.questoes[String(q)];
+    if (!def) return of;
+    const v = str(of).trim();
+    if (!(def.opcoes || []).includes(v)) return of;
+    const troca = (def.na_planilha || {})[chaveOpcao(v)];
+    return troca !== undefined ? troca : of;
+  }
+
   // ───────── padronizar (padronizar.py · padronizar_res) ─────────
   const PLACEHOLDERS_DATA = ['01/01/0000', '00/00/0000', '0/0/0', '01/01/1900', '00/00/00'];
-  const semEsp = (s) => semAcento(s).replace(/\s+/g, ' ').trim();
   const Q_FMT_TEL = [4, 18], Q_FMT_CEP = [38, 59], Q_FMT_CPF = [8, 22];
   // Limpa as respostas de UM cadastro, em memória. Devolve quantos campos mudaram.
   function padronizarRespostas(P, resp) {
@@ -229,11 +256,8 @@
       const def = P.questoes[String(qi)] || {};
       let novo;
       if (qi === 5 || qi === 19) novo = resolverNacionalidade(v, ec, resp[qi === 5 ? '3' : '17'])[0];
-      else if (def.tipo === 'select') {
-        const canon = {};
-        (def.opcoes || []).forEach((op) => { canon[semEsp(op)] = op; });
-        novo = canon[semEsp(v)] !== undefined ? canon[semEsp(v)] : v;
-      } else if (P.q_escrita_padrao.includes(qi)) novo = escritaPadrao(P, v);
+      else if (def.tipo === 'select') novo = formaOficial(P, qi, v);
+      else if (P.q_escrita_padrao.includes(qi)) novo = escritaPadrao(P, v);
       else if (P.q_minuscula.includes(qi)) novo = v.toLowerCase();
       else if (Q_FMT_CPF.includes(qi)) novo = (pj && qi === 8) ? mascaraValor('cnpj', v) : mascaraValor('cpf', v);
       else if (Q_FMT_CEP.includes(qi)) novo = mascaraValor('cep', v);
@@ -565,22 +589,34 @@
   }
 
   // ───────── planilha (VERIFICADOR_IA.gerar_planilha, padronizar=True) ─────────
-  function linhaDoBanco(P, resp, nucleosMap, nucleoNome) {
+  // OQ.forma_oficial_coluna — colunas de cartório que o CDRF compara exatamente
+  function formaOficialColuna(P, n, valor) {
+    const ops = (P.colunas_opcoes || {})[String(n)];
+    const v = str(valor).trim();
+    if (!ops || !v || v === '***') return valor;
+    const k = chaveOpcao(v);
+    for (const op of ops) if (chaveOpcao(op) === k) return op;
+    return valor;
+  }
+  // extra = {idreg, extras:{N: valor}} — o que veio de uma planilha recebida e volta igual
+  function linhaDoBanco(P, resp, nucleosMap, nucleoNome, extra) {
     const codigo = str(resp['1']);
     const pj = classificarEstadoCivil(resp['14']) === 'pessoa juridica';
     const [qd, lt] = quadraLoteDoCodigo(codigo);
     const quadraL = qd === null ? '' : quadraVisivel(qd);
     const loteN = qd === null ? '' : (lt === null ? '' : lt);
+    const ex = extra || {}, extras = ex.extras || {};
     const linha = [];
-    P.colunas.forEach(([cab, q]) => {
-      if (cab === '(1) Id.Registro') linha.push('');
+    P.colunas.forEach(([cab, q], i) => {
+      if (cab === '(1) Id.Registro') linha.push(str(ex.idreg).trim());
       else if (q === 'NUCLEO') linha.push(nucleosMap ? (nucleosMap[codigo.slice(0, 2)] !== undefined ? nucleosMap[codigo.slice(0, 2)] : nucleoNome) : nucleoNome);
       else if (q === 'QUADRA') linha.push(quadraL);
       else if (q === 'LOTE') linha.push(loteN);
       else if (q === 'NUNID') linha.push(codigo ? 1 : '');
-      else if (q === null) linha.push('');
+      else if (q === null) linha.push(formaOficialColuna(P, i + 1, str(extras[String(i + 1)])));
       else {
         let v = corrigirDic(P, q, resp[String(q)]);
+        v = paraPlanilha(P, q, v);       // opções na grafia exata do CDRF oficial
         if (P.q_escrita_padrao.includes(q)) v = escritaPadrao(P, v);
         else if (P.q_minuscula.includes(q)) v = str(v).toLowerCase();
         else if (q === 4 || q === 18) v = formatarTelefone(v);
@@ -596,7 +632,7 @@
     const nucleosMap = mapaNucleosNomes(P.municipios, municipio || null);
     const cabec = P.colunas.map(([c]) => ' ' + c);
     const codigos = Object.keys(cadastros).sort();
-    const linhas = codigos.map((c) => linhaDoBanco(P, cadastros[c].respostas || {}, nucleosMap, ''));
+    const linhas = codigos.map((c) => linhaDoBanco(P, cadastros[c].respostas || {}, nucleosMap, '', cadastros[c]));
     const larg = cabec.map((c, i) => {
       let m = c.length;
       for (const l of linhas) m = Math.max(m, str(l[i]).length);
@@ -615,6 +651,7 @@
     normalizarQuadra, quadraVisivel, nuicDoCodigo, quadraLoteDoCodigo, montarCodigo, loteQuadraDoCodigo,
     chaveNucleo, partesDaChave, nucleoDoCodigo, mapaNucleosNomes, enderecoDoCodigo,
     cascataAplicar, dadosDoNucleo, padronizarRespostas, problemasDasFaixas, resumoCobertura,
+    chaveOpcao, formaOficial, paraPlanilha, formaOficialColuna,
     quadrasDoNucleo, faixasDaQuadra, faixaDoLote, CAMPOS_FAIXA,
     validaCpf, validaCnpj, normData, dataValida, mascaraValor, corValor, validarQuestao,
     escritaPadrao, classificarEstadoCivil, resolverNacionalidade, corrigirDic, formatarTexto,
